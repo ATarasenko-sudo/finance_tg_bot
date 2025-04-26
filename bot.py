@@ -12,7 +12,9 @@ from database import (
     create_user_if_not_exists,
     get_user_by_telegram_id,
     get_categories_by_user,
-    get_monthly_expense_report
+    get_monthly_expense_report,
+    get_monthly_income_report
+
 
 )
 from models import Category
@@ -22,8 +24,11 @@ from decimal import Decimal
 from datetime import date
 from datetime import datetime, time as dtime, timedelta
 
+
+from database import add_income
+
 # 🔐 Вставь сюда свой Telegram Bot Token
-API_TOKEN = ""
+API_TOKEN = 
 
 # Настройка логов
 logging.basicConfig(level=logging.INFO)
@@ -35,12 +40,38 @@ dp = Dispatcher()
 # Главное меню
 main_menu = ReplyKeyboardMarkup(
     keyboard=[
-        [KeyboardButton(text="Категории")],
-        [KeyboardButton(text="Добавить расход"), KeyboardButton(text="Добавить категорию")],
+        [KeyboardButton(text="Категории расходов"), KeyboardButton(text="Категории доходов")],
+        [KeyboardButton(text="Добавить расход"), KeyboardButton(text="Добавить доход")],
         [KeyboardButton(text="Отчет")],
     ],
     resize_keyboard=True,
     input_field_placeholder="Выбери действие ↓"
+)
+
+cancel_keyboard = ReplyKeyboardMarkup(
+    keyboard=[[KeyboardButton(text="⬅ Назад")]],
+    resize_keyboard=True
+)
+
+
+expense_categories_menu = ReplyKeyboardMarkup(
+    keyboard=[
+        [KeyboardButton(text="➕ Добавить категорию расхода")],
+        [KeyboardButton(text="🗑 Удалить категорию расхода")],
+        [KeyboardButton(text="✏️ Редактировать категорию расхода")],
+        [KeyboardButton(text="⬅ Назад")],
+    ],
+    resize_keyboard=True
+)
+
+income_categories_menu = ReplyKeyboardMarkup(
+    keyboard=[
+        [KeyboardButton(text="➕ Добавить категорию дохода")],
+        [KeyboardButton(text="🗑 Удалить категорию дохода")],
+        [KeyboardButton(text="✏️ Редактировать категорию дохода")],
+        [KeyboardButton(text="⬅ Назад")],
+    ],
+    resize_keyboard=True
 )
 
 # FSM состояния
@@ -51,34 +82,23 @@ class ExpenseStates(StatesGroup):
     waiting_for_category_choice = State()
     waiting_for_amount_and_description = State()
 
+class IncomeStates(StatesGroup):
+    waiting_for_income_category_choice = State()
+    waiting_for_income_amount = State()
 
 
+class ExpenseCategoryManageStates(StatesGroup):
+    waiting_for_expense_category_name = State()
+    waiting_for_expense_category_to_delete = State()
+    waiting_for_expense_category_to_edit = State()  
+    waiting_for_new_expense_category_name = State()  
 
-async def send_daily_reminders():
-    while True:
-        now = datetime.now()
-        target_time = datetime.combine(now.date(), dtime(20, 0))  # 20:00
-        if now >= target_time:
-            target_time += timedelta(days=1)
 
-        # Сколько ждать до 20:00
-        wait_seconds = (target_time - now).total_seconds()
-        await asyncio.sleep(wait_seconds)
-
-        # Отправляем напоминания
-        db = SessionLocal()
-        try:
-            users = db.query(get_user_by_telegram_id.__annotations__["db"].class_).all()
-            for user in users:
-                try:
-                    await bot.send_message(
-                        chat_id=user.telegram_id,
-                        text="💬 Не забудь внести свои расходы за сегодня!"
-                    )
-                except Exception as e:
-                    logging.warning(f"Не удалось отправить сообщение пользователю {user.telegram_id}: {e}")
-        finally:
-            db.close()
+class IncomeCategoryManageStates(StatesGroup):
+    waiting_for_income_category_name = State()
+    waiting_for_income_category_to_delete = State()
+    waiting_for_income_category_to_edit = State()
+    waiting_for_new_income_category_name = State()
 
 # Команда /start
 @dp.message(CommandStart())
@@ -90,7 +110,7 @@ async def handle_start(message: Message):
             telegram_id=message.from_user.id,
             username=message.from_user.username
         )
-        await message.answer("👋 Привет! Ты зарегистрирован в системе учёта расходов.", reply_markup=main_menu)
+        await message.answer("👋 Привет! Ты зарегистрирован в системе учёта расходов. \n \tЯ твой личный ассистент, с помощью меня ты можешь фиксировать все свои расходы, для начала тебе надо добавить хотя бы одну категорию, чтобы в дальнейшем записывать в неё соответсвующие траты!", reply_markup=main_menu)
     except Exception as e:
         logging.exception("Ошибка при регистрации пользователя:")
         await message.answer("Произошла ошибка. Попробуй позже.")
@@ -98,40 +118,502 @@ async def handle_start(message: Message):
         db.close()
 
 
-# Кнопка "Категории"
-@dp.message(F.text == "Категории")
-async def handle_categories_button(message: Message):
-    await handle_categories(message)
 
+#--------------------------------------------------------------------------------------------Категории расходов------------------------------------------------------------------------------------
 
-# Функция показа категорий
-async def handle_categories(message: Message):
+@dp.message(F.text == "Категории расходов")
+async def handle_expense_categories(message: Message):
     db = SessionLocal()
     try:
         user = get_user_by_telegram_id(db, message.from_user.id)
         if not user:
-            await message.answer("Ты ещё не зарегистрирован. Напиши /start.")
+            await message.answer("Сначала зарегистрируйся командой /start.")
             return
 
-        categories = get_categories_by_user(db, user.id)
+        categories = db.query(Category).filter_by(user_id=user.id, type="expense").order_by(Category.name).all()
+
         if not categories:
-            await message.answer("🗂️ У тебя пока нет категорий расходов.")
+            await message.answer("🗂️ У тебя пока нет категорий расходов.", reply_markup=expense_categories_menu)
         else:
             category_list = "\n".join(f"• {c.name}" for c in categories)
-            await message.answer(f"🗂️ Твои категории:\n{category_list}")
+            await message.answer(f"🗂️ Твои категории расходов:\n{category_list}", reply_markup=expense_categories_menu)
+
     except Exception as e:
-        logging.exception("Ошибка при получении категорий:")
-        await message.answer("Произошла ошибка при получении категорий.")
+        logging.exception("Ошибка при получении категорий расходов:")
+        await message.answer("Произошла ошибка при получении категорий расходов.")
+    finally:
+        db.close()
+
+@dp.message(F.text == "➕ Добавить категорию расхода")
+async def add_expense_category_start(message: Message, state: FSMContext):
+    await message.answer("🆕 Введи название новой категории расхода:", reply_markup=cancel_keyboard)
+    await state.set_state(ExpenseCategoryManageStates.waiting_for_expense_category_name)
+
+
+@dp.message(ExpenseCategoryManageStates.waiting_for_expense_category_name)
+async def receive_expense_category_name(message: Message, state: FSMContext):
+    if message.text.strip() == "⬅ Назад":
+        await state.clear()
+        await message.answer("🚫 Действие отменено.", reply_markup=main_menu)
+        return
+
+    db = SessionLocal()
+    try:
+        user = get_user_by_telegram_id(db, message.from_user.id)
+        if not user:
+            await message.answer("Сначала зарегистрируйся командой /start.")
+            return
+
+        category_name = message.text.strip()
+
+        # Проверим, нет ли уже такой категории расходов
+        existing = db.query(Category).filter_by(user_id=user.id, name=category_name, type="expense").first()
+        if existing:
+            await message.answer("⚠️ Такая категория расходов уже существует.", reply_markup=expense_categories_menu)
+        else:
+            new_category = Category(user_id=user.id, name=category_name, type="expense")
+            db.add(new_category)
+            db.commit()
+            await message.answer(f"✅ Категория расхода \"{category_name}\" добавлена!", reply_markup=expense_categories_menu)
+
+    except Exception as e:
+        logging.exception("Ошибка при добавлении категории расхода:")
+        await message.answer("Произошла ошибка при добавлении категории расхода.")
+    finally:
+        db.close()
+        await state.clear()
+
+
+@dp.message(F.text == "🗑 Удалить категорию расхода")
+async def delete_expense_category_start(message: Message, state: FSMContext):
+    db = SessionLocal()
+    try:
+        user = get_user_by_telegram_id(db, message.from_user.id)
+        if not user:
+            await message.answer("Сначала зарегистрируйся командой /start.")
+            return
+
+        categories = db.query(Category).filter_by(user_id=user.id, type="expense").order_by(Category.name).all()
+
+        if not categories:
+            await message.answer("❗ У тебя нет категорий расходов для удаления.", reply_markup=expense_categories_menu)
+            return
+
+        # Кнопки с категориями
+        buttons = [KeyboardButton(text=cat.name) for cat in categories]
+        buttons.append(KeyboardButton(text="⬅ Назад"))
+        row_width = 2
+        rows = [buttons[i:i + row_width] for i in range(0, len(buttons), row_width)]
+        delete_category_keyboard = ReplyKeyboardMarkup(keyboard=rows, resize_keyboard=True)
+
+        await message.answer("🗑 Выбери категорию расхода, которую хочешь удалить:", reply_markup=delete_category_keyboard)
+        await state.set_state(ExpenseCategoryManageStates.waiting_for_expense_category_to_delete)
+
     finally:
         db.close()
 
 
-# Кнопка "Добавить категорию"
-@dp.message(F.text == "Добавить категорию")
-async def start_adding_category(message: Message, state: FSMContext):
-    await message.answer("🆕 Введи название новой категории:")
-    await state.set_state(CategoryStates.waiting_for_category_name)
+@dp.message(ExpenseCategoryManageStates.waiting_for_expense_category_to_delete)
+async def delete_expense_category_confirm(message: Message, state: FSMContext):
+    if message.text.strip() == "⬅ Назад":
+        await state.clear()
+        await message.answer("🚫 Действие отменено.", reply_markup=expense_categories_menu)
+        return
 
+    db = SessionLocal()
+    try:
+        category_name = message.text.strip()
+        user = get_user_by_telegram_id(db, message.from_user.id)
+
+        if not user:
+            await message.answer("Сначала зарегистрируйся командой /start.")
+            return
+
+        category = db.query(Category).filter_by(user_id=user.id, name=category_name, type="expense").first()
+
+        if not category:
+            await message.answer("❗ Категория расхода не найдена.", reply_markup=expense_categories_menu)
+        else:
+            db.delete(category)
+            db.commit()
+            await message.answer(f"✅ Категория расхода \"{category_name}\" удалена!", reply_markup=expense_categories_menu)
+
+    except Exception as e:
+        logging.exception("Ошибка при удалении категории расхода:")
+        await message.answer("Произошла ошибка при удалении категории расхода.")
+    finally:
+        db.close()
+        await state.clear()
+
+@dp.message(F.text == "✏️ Редактировать категорию расхода")
+async def edit_expense_category_start(message: Message, state: FSMContext):
+    db = SessionLocal()
+    try:
+        user = get_user_by_telegram_id(db, message.from_user.id)
+        if not user:
+            await message.answer("Сначала зарегистрируйся командой /start.")
+            return
+
+        categories = db.query(Category).filter_by(user_id=user.id, type="expense").order_by(Category.name).all()
+
+        if not categories:
+            await message.answer("❗ У тебя нет категорий расходов для редактирования.", reply_markup=expense_categories_menu)
+            return
+
+        # Кнопки с категориями
+        buttons = [KeyboardButton(text=cat.name) for cat in categories]
+        buttons.append(KeyboardButton(text="⬅ Назад"))
+        row_width = 2
+        rows = [buttons[i:i + row_width] for i in range(0, len(buttons), row_width)]
+        edit_category_keyboard = ReplyKeyboardMarkup(keyboard=rows, resize_keyboard=True)
+
+        await message.answer("✏️ Выбери категорию расхода для редактирования:", reply_markup=edit_category_keyboard)
+        await state.set_state(ExpenseCategoryManageStates.waiting_for_expense_category_to_edit)
+
+    finally:
+        db.close()
+
+
+@dp.message(ExpenseCategoryManageStates.waiting_for_expense_category_to_edit)
+async def choose_expense_category_to_edit(message: Message, state: FSMContext):
+    if message.text.strip() == "⬅ Назад":
+        await state.clear()
+        await message.answer("🚫 Действие отменено.", reply_markup=expense_categories_menu)
+        return
+
+    await state.update_data(old_category_name=message.text.strip())
+    await message.answer("✏️ Введи новое название для выбранной категории:", reply_markup=cancel_keyboard)
+    await state.set_state(ExpenseCategoryManageStates.waiting_for_new_expense_category_name)
+
+
+@dp.message(ExpenseCategoryManageStates.waiting_for_new_expense_category_name)
+async def save_new_expense_category_name(message: Message, state: FSMContext):
+    if message.text.strip() == "⬅ Назад":
+        await state.clear()
+        await message.answer("🚫 Действие отменено.", reply_markup=expense_categories_menu)
+        return
+
+    db = SessionLocal()
+    try:
+        user = get_user_by_telegram_id(db, message.from_user.id)
+        data = await state.get_data()
+        old_category_name = data.get("old_category_name")
+        new_category_name = message.text.strip()
+
+        if not user:
+            await message.answer("Сначала зарегистрируйся командой /start.")
+            return
+
+        category = db.query(Category).filter_by(user_id=user.id, name=old_category_name, type="expense").first()
+
+        if not category:
+            await message.answer("❗ Выбранная категория расхода не найдена.", reply_markup=expense_categories_menu)
+        else:
+            category.name = new_category_name
+            db.commit()
+            await message.answer(f"✅ Категория расхода переименована в \"{new_category_name}\"!", reply_markup=expense_categories_menu)
+
+    except Exception as e:
+        logging.exception("Ошибка при редактировании категории расхода:")
+        await message.answer("Произошла ошибка при редактировании категории расхода.")
+    finally:
+        db.close()
+        await state.clear()
+
+#------------------------------------------------------------------Категории доходов---------------------------------------------------------------
+@dp.message(F.text == "Категории доходов")
+async def handle_income_categories(message: Message):
+    db = SessionLocal()
+    try:
+        user = get_user_by_telegram_id(db, message.from_user.id)
+        if not user:
+            await message.answer("Сначала зарегистрируйся командой /start.")
+            return
+
+        categories = db.query(Category).filter_by(user_id=user.id, type="income").order_by(Category.name).all()
+
+        if not categories:
+            await message.answer("🗂️ У тебя пока нет категорий доходов.", reply_markup=income_categories_menu)
+        else:
+            category_list = "\n".join(f"• {c.name}" for c in categories)
+            await message.answer(f"🗂️ Твои категории доходов:\n{category_list}", reply_markup=income_categories_menu)
+
+    except Exception as e:
+        logging.exception("Ошибка при получении категорий доходов:")
+        await message.answer("Произошла ошибка при получении категорий доходов.")
+    finally:
+        db.close()
+
+@dp.message(F.text == "➕ Добавить категорию дохода")
+async def add_income_category_start(message: Message, state: FSMContext):
+    await message.answer("🆕 Введи название новой категории дохода:", reply_markup=cancel_keyboard)
+    await state.set_state(IncomeCategoryManageStates.waiting_for_income_category_name)
+
+
+@dp.message(IncomeCategoryManageStates.waiting_for_income_category_name)
+async def receive_income_category_name(message: Message, state: FSMContext):
+    if message.text.strip() == "⬅ Назад":
+        await state.clear()
+        await message.answer("🚫 Действие отменено.", reply_markup=main_menu)
+        return
+
+    db = SessionLocal()
+    try:
+        user = get_user_by_telegram_id(db, message.from_user.id)
+        if not user:
+            await message.answer("Сначала зарегистрируйся командой /start.")
+            return
+
+        category_name = message.text.strip()
+
+        # Проверим, нет ли уже такой категории доходов
+        existing = db.query(Category).filter_by(user_id=user.id, name=category_name, type="income").first()
+        if existing:
+            await message.answer("⚠️ Такая категория дохода уже существует.", reply_markup=income_categories_menu)
+        else:
+            new_category = Category(user_id=user.id, name=category_name, type="income")
+            db.add(new_category)
+            db.commit()
+            await message.answer(f"✅ Категория дохода \"{category_name}\" добавлена!", reply_markup=income_categories_menu)
+
+    except Exception as e:
+        logging.exception("Ошибка при добавлении категории дохода:")
+        await message.answer("Произошла ошибка при добавлении категории дохода.")
+    finally:
+        db.close()
+        await state.clear()
+
+
+
+@dp.message(F.text == "🗑 Удалить категорию дохода")
+async def delete_income_category_start(message: Message, state: FSMContext):
+    db = SessionLocal()
+    try:
+        user = get_user_by_telegram_id(db, message.from_user.id)
+        if not user:
+            await message.answer("Сначала зарегистрируйся командой /start.")
+            return
+
+        categories = db.query(Category).filter_by(user_id=user.id, type="income").order_by(Category.name).all()
+
+        if not categories:
+            await message.answer("❗ У тебя нет категорий доходов для удаления.", reply_markup=income_categories_menu)
+            return
+
+        # Кнопки с названиями категорий доходов
+        buttons = [KeyboardButton(text=cat.name) for cat in categories]
+        buttons.append(KeyboardButton(text="⬅ Назад"))
+        row_width = 2
+        rows = [buttons[i:i + row_width] for i in range(0, len(buttons), row_width)]
+        delete_income_category_keyboard = ReplyKeyboardMarkup(keyboard=rows, resize_keyboard=True)
+
+        await message.answer("🗑 Выбери категорию дохода для удаления:", reply_markup=delete_income_category_keyboard)
+        await state.set_state(IncomeCategoryManageStates.waiting_for_income_category_to_delete)
+
+    finally:
+        db.close()
+
+@dp.message(IncomeCategoryManageStates.waiting_for_income_category_to_delete)
+async def delete_income_category_confirm(message: Message, state: FSMContext):
+    if message.text.strip() == "⬅ Назад":
+        await state.clear()
+        await message.answer("🚫 Действие отменено.", reply_markup=income_categories_menu)
+        return
+
+    db = SessionLocal()
+    try:
+        category_name = message.text.strip()
+        user = get_user_by_telegram_id(db, message.from_user.id)
+
+        if not user:
+            await message.answer("Сначала зарегистрируйся командой /start.")
+            return
+
+        category = db.query(Category).filter_by(user_id=user.id, name=category_name, type="income").first()
+
+        if not category:
+            await message.answer("❗ Категория дохода не найдена.", reply_markup=income_categories_menu)
+        else:
+            db.delete(category)
+            db.commit()
+            await message.answer(f"✅ Категория дохода \"{category_name}\" удалена!", reply_markup=income_categories_menu)
+
+    except Exception as e:
+        logging.exception("Ошибка при удалении категории дохода:")
+        await message.answer("Произошла ошибка при удалении категории дохода.")
+    finally:
+        db.close()
+        await state.clear()
+
+
+@dp.message(F.text == "✏️ Редактировать категорию дохода")
+async def edit_income_category_start(message: Message, state: FSMContext):
+    db = SessionLocal()
+    try:
+        user = get_user_by_telegram_id(db, message.from_user.id)
+        if not user:
+            await message.answer("Сначала зарегистрируйся командой /start.")
+            return
+
+        categories = db.query(Category).filter_by(user_id=user.id, type="income").order_by(Category.name).all()
+
+        if not categories:
+            await message.answer("❗ У тебя нет категорий доходов для редактирования.", reply_markup=income_categories_menu)
+            return
+
+        # Кнопки с категориями доходов
+        buttons = [KeyboardButton(text=cat.name) for cat in categories]
+        buttons.append(KeyboardButton(text="⬅ Назад"))
+        row_width = 2
+        rows = [buttons[i:i + row_width] for i in range(0, len(buttons), row_width)]
+        edit_income_category_keyboard = ReplyKeyboardMarkup(keyboard=rows, resize_keyboard=True)
+
+        await message.answer("✏️ Выбери категорию дохода для редактирования:", reply_markup=edit_income_category_keyboard)
+        await state.set_state(IncomeCategoryManageStates.waiting_for_income_category_to_edit)
+
+    finally:
+        db.close()
+
+
+@dp.message(IncomeCategoryManageStates.waiting_for_income_category_to_edit)
+async def choose_income_category_to_edit(message: Message, state: FSMContext):
+    if message.text.strip() == "⬅ Назад":
+        await state.clear()
+        await message.answer("🚫 Действие отменено.", reply_markup=income_categories_menu)
+        return
+
+    await state.update_data(old_income_category_name=message.text.strip())
+    await message.answer("✏️ Введи новое название для выбранной категории дохода:", reply_markup=cancel_keyboard)
+    await state.set_state(IncomeCategoryManageStates.waiting_for_new_income_category_name)
+
+
+@dp.message(IncomeCategoryManageStates.waiting_for_new_income_category_name)
+async def save_new_income_category_name(message: Message, state: FSMContext):
+    if message.text.strip() == "⬅ Назад":
+        await state.clear()
+        await message.answer("🚫 Действие отменено.", reply_markup=income_categories_menu)
+        return
+
+    db = SessionLocal()
+    try:
+        user = get_user_by_telegram_id(db, message.from_user.id)
+        data = await state.get_data()
+        old_category_name = data.get("old_income_category_name")
+        new_category_name = message.text.strip()
+
+        if not user:
+            await message.answer("Сначала зарегистрируйся командой /start.")
+            return
+
+        category = db.query(Category).filter_by(user_id=user.id, name=old_category_name, type="income").first()
+
+        if not category:
+            await message.answer("❗ Выбранная категория дохода не найдена.", reply_markup=income_categories_menu)
+        else:
+            category.name = new_category_name
+            db.commit()
+            await message.answer(f"✅ Категория дохода переименована в \"{new_category_name}\"!", reply_markup=income_categories_menu)
+
+    except Exception as e:
+        logging.exception("Ошибка при редактировании категории дохода:")
+        await message.answer("Произошла ошибка при редактировании категории дохода.")
+    finally:
+        db.close()
+        await state.clear()
+
+
+#----------------------------------------------------------------Добавление дохода--------------------------------------------------
+
+@dp.message(F.text == "Добавить доход")
+async def handle_add_income(message: Message, state: FSMContext):
+    db = SessionLocal()
+    try:
+        user = get_user_by_telegram_id(db, message.from_user.id)
+        if not user:
+            await message.answer("Сначала напиши /start.")
+            return
+
+        categories = db.query(Category).filter_by(user_id=user.id, type="income").order_by(Category.name).all()
+
+        if not categories:
+            await message.answer("❗ У тебя нет категорий доходов. Сначала добавь хотя бы одну.", reply_markup=main_menu)
+            return
+
+        # Кнопки с категориями доходов
+        buttons = [KeyboardButton(text=cat.name) for cat in categories]
+        buttons.append(KeyboardButton(text="⬅ Назад"))
+        row_width = 2
+        rows = [buttons[i:i + row_width] for i in range(0, len(buttons), row_width)]
+        income_category_keyboard = ReplyKeyboardMarkup(keyboard=rows, resize_keyboard=True)
+
+        await message.answer("💸 Из какой категории доход?", reply_markup=income_category_keyboard)
+        await state.set_state(IncomeStates.waiting_for_income_category_choice)
+
+    finally:
+        db.close()
+
+
+@dp.message(IncomeStates.waiting_for_income_category_choice)
+async def handle_income_category_chosen(message: Message, state: FSMContext):
+    if message.text.strip() == "⬅ Назад":
+        await state.clear()
+        await message.answer("🚫 Действие отменено.", reply_markup=main_menu)
+        return
+
+    selected_category = message.text.strip()
+    await state.update_data(selected_income_category=selected_category)
+
+    await message.answer("✍️ Введи сумму дохода (только число):", reply_markup=ReplyKeyboardRemove())
+    await state.set_state(IncomeStates.waiting_for_income_amount)
+
+
+
+@dp.message(IncomeStates.waiting_for_income_amount)
+async def handle_income_amount(message: Message, state: FSMContext):
+    if message.text.strip() == "⬅ Назад":
+        await state.clear()
+        await message.answer("🚫 Действие отменено.", reply_markup=main_menu)
+        return
+
+    db = SessionLocal()
+    try:
+        user = get_user_by_telegram_id(db, message.from_user.id)
+        if not user:
+            await message.answer("Сначала напиши /start.")
+            return
+
+        data = await state.get_data()
+        category_name = data.get("selected_income_category")
+
+        category = db.query(Category).filter_by(user_id=user.id, name=category_name, type="income").first()
+
+        if not category:
+            await message.answer("❗ Категория дохода не найдена.", reply_markup=main_menu)
+            await state.clear()
+            return
+
+        try:
+            amount = Decimal(message.text.strip().replace(",", "."))
+        except:
+            await message.answer("❗ Введи только сумму, например: `5000.00`")
+            return
+
+        # Сохраняем доход
+        add_income(db, user_id=user.id, category_id=category.id, amount=amount)
+
+        await message.answer(f"✅ Доход {amount}₽ в категории \"{category_name}\" добавлен!", reply_markup=main_menu)
+
+    except Exception as e:
+        logging.exception("Ошибка при добавлении дохода:")
+        await message.answer("Произошла ошибка при добавлении дохода.")
+    finally:
+        db.close()
+        await state.clear()
+
+
+
+
+#----------------------------------------------------------------Добавление расхода-------------------------------------------------
 
 
 @dp.message(F.text == "Добавить расход")
@@ -143,13 +625,14 @@ async def handle_add_expense(message: Message, state: FSMContext):
             await message.answer("Сначала напиши /start.")
             return
 
-        categories = get_categories_by_user(db, user.id)
+        categories = db.query(Category).filter_by(user_id=user.id, type="expense").order_by(Category.name).all()
         if not categories:
             await message.answer("У тебя пока нет категорий. Добавь хотя бы одну.")
             return
 
         # Кнопки с категориями
         buttons = [KeyboardButton(text=cat.name) for cat in categories]
+        buttons.append(KeyboardButton(text="⬅ Назад"))
         row_width = 2
         rows = [buttons[i:i + row_width] for i in range(0, len(buttons), row_width)]
         category_keyboard = ReplyKeyboardMarkup(keyboard=rows, resize_keyboard=True)
@@ -162,6 +645,11 @@ async def handle_add_expense(message: Message, state: FSMContext):
 
 @dp.message(ExpenseStates.waiting_for_category_choice)
 async def handle_category_chosen(message: Message, state: FSMContext):
+
+    if message.text == "⬅ Назад":
+        await state.clear()
+        await message.answer("🚫 Действие отменено.", reply_markup=main_menu)
+        return
     selected_category = message.text.strip()
     await state.update_data(selected_category=selected_category)
 
@@ -170,6 +658,10 @@ async def handle_category_chosen(message: Message, state: FSMContext):
 
 @dp.message(ExpenseStates.waiting_for_amount_and_description)
 async def handle_amount_only(message: Message, state: FSMContext):
+    if message.text == "⬅ Назад":
+        await state.clear()
+        await message.answer("🚫 Действие отменено.", reply_markup=main_menu)
+        return
     db = SessionLocal()
     try:
         user = get_user_by_telegram_id(db, message.from_user.id)
@@ -181,7 +673,7 @@ async def handle_amount_only(message: Message, state: FSMContext):
         category_name = data.get("selected_category")
 
         # Найдём категорию
-        category = db.query(Category).filter_by(user_id=user.id, name=category_name).first()
+        category = db.query(Category).filter_by(user_id=user.id, name=category_name, type="expense").first()
         if not category:
             await message.answer("Категория не найдена. Попробуй заново.")
             await state.clear()
@@ -219,6 +711,11 @@ async def handle_amount_only(message: Message, state: FSMContext):
 # Обработка ввода категории
 @dp.message(CategoryStates.waiting_for_category_name)
 async def receive_category_name(message: Message, state: FSMContext):
+    if message.text.strip() == "⬅ Назад":
+        await state.clear()
+        await message.answer("🚫 Действие отменено.", reply_markup=main_menu)
+        return
+
     db = SessionLocal()
     try:
         user = get_user_by_telegram_id(db, message.from_user.id)
@@ -247,7 +744,6 @@ async def receive_category_name(message: Message, state: FSMContext):
 
 
 
-
 @dp.message(F.text == "Отчет")
 async def handle_report(message: Message):
     db = SessionLocal()
@@ -257,30 +753,69 @@ async def handle_report(message: Message):
             await message.answer("Сначала напиши /start.")
             return
 
-        report = get_monthly_expense_report(db, user.id)
+        # Получение расходов и доходов
+        try:
+            expense_report = get_monthly_expense_report(db, user.id)
+        except Exception as e:
+            expense_report = []
+            logging.error(f"Ошибка при получении расходов: {e}")
 
-        if not report:
-            await message.answer("📭 В этом месяце у тебя ещё нет расходов.")
-            return
+        try:
+            income_report = get_monthly_income_report(db, user.id)
+        except Exception as e:
+            income_report = []
+            logging.error(f"Ошибка при получении доходов: {e}")
 
-        total = sum([row[1] for row in report])
-        lines = [f"📊 Расходы за {date.today():%B}:\n"]
-        for name, amount in report:
-            lines.append(f"• {name}: {float(amount):,.2f} ₽")
-        lines.append(f"\n💰 Всего: {float(total):,.2f} ₽")
+        lines = []
+
+        # Блок расходов
+        if expense_report:
+            total_expenses = sum([(row[1] or 0) for row in expense_report])
+            lines.append(f"📊 Расходы за {date.today():%B}:\n")
+            for name, amount in expense_report:
+                lines.append(f"• {name}: {float(amount or 0):,.2f} ₽")
+            lines.append(f"💰 Всего расходов: {float(total_expenses):,.2f} ₽\n")
+        else:
+            lines.append("📭 В этом месяце расходов не найдено.\n")
+
+        # Блок доходов
+        if income_report:
+            total_incomes = sum([(row[1] or 0) for row in income_report])
+            lines.append(f"📈 Доходы за {date.today():%B}:\n")
+            for name, amount in income_report:
+                lines.append(f"• {name}: {float(amount or 0):,.2f} ₽")
+            lines.append(f"💵 Всего доходов: {float(total_incomes):,.2f} ₽\n")
+        else:
+            lines.append("📭 В этом месяце доходов не найдено.\n")
+
+        # Баланс
+        if expense_report or income_report:
+            total_expenses = sum([(row[1] or 0) for row in expense_report]) if expense_report else 0
+            total_incomes = sum([(row[1] or 0) for row in income_report]) if income_report else 0
+            balance = total_incomes - total_expenses
+            balance_sign = "➕" if balance >= 0 else "➖"
+            lines.append(f"🏦 Баланс за месяц: {balance_sign} {abs(balance):,.2f} ₽")
 
         await message.answer("\n".join(lines))
+
     except Exception as e:
-        logging.exception("Ошибка при формировании отчета:")
+        logging.exception(f"Глобальная ошибка при формировании отчета: {e}")
         await message.answer("Произошла ошибка при формировании отчёта.")
     finally:
         db.close()
 
 
 
+
+from aiogram.fsm.state import any_state
+
+@dp.message(F.text == "⬅ Назад", any_state)
+async def handle_cancel(message: Message, state: FSMContext):
+    await state.clear()
+    await message.answer("🚫 Действие отменено.", reply_markup=main_menu)
+
 # Запуск бота
 async def main():
-    reminder_task = asyncio.create_task(send_daily_reminders())
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
